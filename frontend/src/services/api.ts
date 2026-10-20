@@ -159,3 +159,218 @@ export async function fetchModelMetrics(): Promise<ModelMetrics> {
   if (!res.ok) throw new Error('Failed to fetch model evaluation metrics');
   return res.json();
 }
+
+// =========================================================================
+// Phase 7 Pilot Operational Data Capture API
+// =========================================================================
+
+import type {
+  MealService,
+  MenuItem,
+  DemandObservation,
+  ProductionRecord,
+  ServiceRecord,
+  WasteRecord,
+  ServiceDetails,
+  PilotQualityReport,
+  POSImportResult,
+} from '../types/pilot';
+
+export async function fetchPilotServices(section?: string, limit: number = 50): Promise<MealService[]> {
+  const qs = buildQuery({ canteen_section: section, limit });
+  const res = await fetch(`${API_BASE}/pilot/services${qs}`);
+  if (!res.ok) throw new Error('Failed to load pilot meal services');
+  return res.json();
+}
+
+export async function createPilotService(payload: {
+  service_date: string;
+  meal_period: string;
+  canteen_section: string;
+  notes?: string;
+}): Promise<MealService> {
+  const res = await fetch(`${API_BASE}/pilot/services`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to create meal service');
+  }
+  return res.json();
+}
+
+export async function fetchPilotServiceDetails(serviceId: string): Promise<ServiceDetails> {
+  const res = await fetch(`${API_BASE}/pilot/services/${encodeURIComponent(serviceId)}`);
+  if (!res.ok) throw new Error('Failed to load service details');
+  return res.json();
+}
+
+export async function updatePilotServiceStatus(
+  serviceId: string,
+  status: string,
+  notes?: string,
+  updatedBy?: string
+): Promise<MealService> {
+  const res = await fetch(`${API_BASE}/pilot/services/${encodeURIComponent(serviceId)}/status`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, notes, updated_by: updatedBy }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update service status');
+  }
+  return res.json();
+}
+
+export async function fetchPilotMenuItems(): Promise<MenuItem[]> {
+  const res = await fetch(`${API_BASE}/pilot/menu-items`);
+  if (!res.ok) throw new Error('Failed to load master menu items');
+  return res.json();
+}
+
+export async function createPilotMenuItem(payload: {
+  item_id: string;
+  item_name: string;
+  food_category: string;
+  standard_portion_unit: string;
+  standard_portion_grams: number;
+}): Promise<MenuItem> {
+  const res = await fetch(`${API_BASE}/pilot/menu-items`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to register dish item');
+  }
+  return res.json();
+}
+
+export async function addMenuToPilotService(
+  serviceId: string,
+  payload: { item_id: string; planned_portions?: number }
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/pilot/services/${encodeURIComponent(serviceId)}/menu`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to add dish to service');
+  }
+  return res.json();
+}
+
+export async function recordPilotDemandObservation(
+  serviceId: string,
+  payload: {
+    observation_source: string;
+    expected_headcount: number;
+    confidence_score?: number;
+    recorded_by?: string;
+  }
+): Promise<DemandObservation> {
+  const res = await fetch(`${API_BASE}/pilot/services/${encodeURIComponent(serviceId)}/observations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to record pre-service headcount');
+  }
+  return res.json();
+}
+
+export async function recordPilotProduction(
+  menuEntryId: string,
+  payload: {
+    portions_prepared: number;
+    prepared_weight_kg?: number;
+    batch_completion_time?: string;
+    logged_by?: string;
+  }
+): Promise<ProductionRecord> {
+  const res = await fetch(`${API_BASE}/pilot/menu/${encodeURIComponent(menuEntryId)}/production`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to record batch production');
+  }
+  return res.json();
+}
+
+export async function recordPilotService(
+  menuEntryId: string,
+  payload: {
+    portions_served: number;
+    stockout_occurred: boolean;
+    stockout_time?: string;
+    data_source?: string;
+    logged_by?: string;
+  }
+): Promise<ServiceRecord> {
+  const res = await fetch(`${API_BASE}/pilot/menu/${encodeURIComponent(menuEntryId)}/service`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to record portions served');
+  }
+  return res.json();
+}
+
+export async function recordPilotWaste(
+  menuEntryId: string,
+  payload: {
+    unserved_surplus_weight_kg: number;
+    plate_waste_weight_kg: number;
+    disposal_destination?: string;
+    logged_by?: string;
+  }
+): Promise<WasteRecord> {
+  const res = await fetch(`${API_BASE}/pilot/menu/${encodeURIComponent(menuEntryId)}/waste`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to record waste measurements');
+  }
+  return res.json();
+}
+
+export async function importPilotPOSCsv(csvContent: string): Promise<POSImportResult> {
+  const res = await fetch(`${API_BASE}/pilot/pos/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ csv_content: csvContent }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'POS CSV import failed');
+  }
+  return res.json();
+}
+
+export async function fetchPilotQualityReport(): Promise<PilotQualityReport> {
+  const res = await fetch(`${API_BASE}/pilot/quality-report`);
+  if (!res.ok) throw new Error('Failed to load pilot quality report');
+  return res.json();
+}
+
+export function getPilotExportUrl(): string {
+  return `${API_BASE}/pilot/export`;
+}
+

@@ -6,6 +6,7 @@ import { PredictPage } from './pages/PredictPage';
 import { HistoryPage } from './pages/HistoryPage';
 import { ModelsPage } from './pages/ModelsPage';
 import { DataExplorerPage } from './pages/DataExplorerPage';
+import { PilotDataCapturePage } from './pages/PilotDataCapturePage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -28,6 +29,7 @@ export function App() {
             <Route path="history" element={<HistoryPage />} />
             <Route path="models" element={<ModelsPage />} />
             <Route path="data" element={<DataExplorerPage />} />
+            <Route path="pilot" element={<PilotDataCapturePage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

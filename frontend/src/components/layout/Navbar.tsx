@@ -7,6 +7,7 @@ import {
   History,
   Activity,
   Database,
+  ClipboardList,
   Menu,
   X,
   Sparkles,
@@ -28,6 +29,7 @@ export function Navbar({ health, isLoadingHealth }: NavbarProps) {
     { name: 'Prediction History', path: '/history', icon: History },
     { name: 'Model Insights', path: '/models', icon: Activity },
     { name: 'Data Explorer', path: '/data', icon: Database },
+    { name: 'Pilot Data Capture', path: '/pilot', icon: ClipboardList },
   ];
 
   const isOnline = health?.status === 'healthy';

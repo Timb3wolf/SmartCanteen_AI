@@ -12,6 +12,7 @@ from backend.app.api.health import router as health_router
 from backend.app.api.metadata import router as metadata_router
 from backend.app.api.models_info import router as models_router
 from backend.app.api.predictions import router as predictions_router
+from backend.app.pilot import pilot_router
 from backend.app.core.config import API_V1_PREFIX, PROJECT_NAME, PROJECT_VERSION, get_cors_origins
 from backend.app.core.database import init_db
 from backend.app.services.analytics_service import AnalyticsService
@@ -77,6 +78,7 @@ app.include_router(metadata_router, prefix=API_V1_PREFIX)
 app.include_router(analytics_router, prefix=API_V1_PREFIX)
 app.include_router(predictions_router, prefix=API_V1_PREFIX)
 app.include_router(models_router, prefix=API_V1_PREFIX)
+app.include_router(pilot_router, prefix=API_V1_PREFIX)
 
 
 @app.get("/")
