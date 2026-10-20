@@ -400,6 +400,12 @@ class TemporalFeaturePipeline:
                 hist = hist.copy()
                 hist["parsed_date"] = hist[self.config.date_column].apply(parse_strict_date)
 
+        # Pre-index history by grouping keys for fast O(1) group lookup
+        hist_by_key: Dict[Tuple[str, str, str], pd.DataFrame] = {}
+        if not hist.empty and all(k in hist.columns for k in self.config.grouping_keys):
+            for k_val, grp in hist.groupby(self.config.grouping_keys):
+                hist_by_key[k_val] = grp.sort_values("parsed_date")
+
         rows: List[Dict[str, float]] = []
 
         for _, row in df.iterrows():
@@ -410,13 +416,12 @@ class TemporalFeaturePipeline:
             price = float(row[self.config.price_column])
 
             # Filter historical records strictly before prediction date
-            mask = (
-                (hist["parsed_date"] < pred_date)
-                & (hist["Canteen_Section"] == sec)
-                & (hist["Meal"] == meal)
-                & (hist["Food_Category"] == cat)
-            )
-            prior_records = hist[mask]
+            key = (sec, meal, cat)
+            grp = hist_by_key.get(key)
+            if grp is not None and not grp.empty:
+                prior_records = grp[grp["parsed_date"] < pred_date]
+            else:
+                prior_records = pd.DataFrame(columns=hist.columns)
 
             dow = float(pred_date.weekday())
             row_feats: Dict[str, float] = {
