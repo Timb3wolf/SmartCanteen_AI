@@ -25,6 +25,13 @@ from backend.app.ml.benchmark import (
     ModelFoldResult,
 )
 
+from backend.app.ml.ensemble import (
+    ChronologicalStackingMetaLearner,
+    EnsembleExperimentRunner,
+    EnsembleSpec,
+    WeightedAverageEnsemble,
+)
+
 __all__ = [
     "TemporalFeatureConfig",
     "TemporalFeaturePipeline",
@@ -44,4 +51,9 @@ __all__ = [
     "BenchmarkModelSpec",
     "ModelBenchmarkRunner",
     "ModelFoldResult",
+    "ChronologicalStackingMetaLearner",
+    "EnsembleExperimentRunner",
+    "EnsembleSpec",
+    "WeightedAverageEnsemble",
 ]
+
