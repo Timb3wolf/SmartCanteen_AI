@@ -1,4 +1,4 @@
-"""Machine Learning modules, feature pipelines, and evaluation frameworks for SmartCanteen AI."""
+"""Machine Learning modules, feature pipelines, evaluation, and benchmarking for SmartCanteen AI."""
 
 from backend.app.ml.features import (
     TemporalFeatureConfig,
@@ -18,6 +18,12 @@ from backend.app.ml.evaluation import (
     evaluate_regression,
     safe_r2_score,
 )
+from backend.app.ml.benchmark import (
+    BenchmarkFoldRecord,
+    BenchmarkModelSpec,
+    ModelBenchmarkRunner,
+    ModelFoldResult,
+)
 
 __all__ = [
     "TemporalFeatureConfig",
@@ -34,4 +40,8 @@ __all__ = [
     "evaluate_classification",
     "evaluate_regression",
     "safe_r2_score",
+    "BenchmarkFoldRecord",
+    "BenchmarkModelSpec",
+    "ModelBenchmarkRunner",
+    "ModelFoldResult",
 ]
