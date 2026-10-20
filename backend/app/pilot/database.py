@@ -1,31 +1,39 @@
 """SQLite database connection and schema manager for the isolated Pilot Data Store.
 
 Enforces:
+- Complete physical isolation from production database (path validation)
 - Foreign key constraints (PRAGMA foreign_keys = ON)
+- Concurrency timeout (PRAGMA busy_timeout = 5000)
 - Strict unique constraints on meal services and menu allocations
-- Audit trail logging and revision tracking via superseded_by_id
-- Complete physical separation from production database
+- Temporal cutoff tracking and late-entry flagging
+- Audit trail logging and revision tracking via superseded_by_id and correction_reason
+- Safeguarded, non-accidental reset procedures
 """
 
 from pathlib import Path
 import sqlite3
 from typing import Optional
-from backend.app.pilot.config import PILOT_DATABASE_PATH
+from backend.app.pilot.config import PILOT_DATABASE_PATH, PILOT_TIMEZONE, validate_pilot_db_path
 
 
 def get_pilot_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
-    """Create and return an isolated SQLite connection with foreign keys enabled."""
+    """Create and return an isolated SQLite connection with foreign keys and timeout enabled."""
     target_path = db_path or PILOT_DATABASE_PATH
+    validate_pilot_db_path(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(target_path))
+    conn = sqlite3.connect(str(target_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
     return conn
 
 
 def init_pilot_db(db_path: Optional[Path] = None) -> None:
     """Initialize all 8 Phase 6 relational tables and audit logging table."""
-    with get_pilot_connection(db_path) as conn:
+    target_path = db_path or PILOT_DATABASE_PATH
+    validate_pilot_db_path(target_path)
+
+    with get_pilot_connection(target_path) as conn:
         cursor = conn.cursor()
 
         # 1. Meal_Service
@@ -39,6 +47,8 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
                 service_status TEXT NOT NULL DEFAULT 'Planned' CHECK(service_status IN ('Planned', 'In_Prep', 'Serving', 'Closed', 'Audited')),
                 scheduled_start TEXT NOT NULL,
                 scheduled_end TEXT NOT NULL,
+                prediction_cutoff_time TEXT NOT NULL,
+                service_timezone TEXT NOT NULL DEFAULT 'Asia/Colombo',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(service_date, meal_period, canteen_section)
@@ -89,6 +99,8 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
                 expected_headcount INTEGER NOT NULL CHECK(expected_headcount >= 0),
                 observation_source TEXT NOT NULL,
                 registered_reservations INTEGER NOT NULL DEFAULT 0 CHECK(registered_reservations >= 0),
+                is_late_entry INTEGER NOT NULL DEFAULT 0 CHECK(is_late_entry IN (0, 1)),
+                prediction_cutoff_timestamp TEXT,
                 notes TEXT,
                 recorded_at TEXT NOT NULL,
                 recorded_by TEXT,
@@ -108,6 +120,7 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
                 portions_prepared INTEGER NOT NULL CHECK(portions_prepared >= 0),
                 prepared_weight_kg REAL CHECK(prepared_weight_kg IS NULL OR prepared_weight_kg >= 0),
                 kitchen_station TEXT DEFAULT 'Main_Station',
+                correction_reason TEXT,
                 recorded_at TEXT NOT NULL,
                 recorded_by TEXT,
                 superseded_by_id TEXT,
@@ -129,6 +142,7 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
                 stockout_time TEXT,
                 gross_sales_amount REAL NOT NULL DEFAULT 0.0 CHECK(gross_sales_amount >= 0),
                 data_source TEXT NOT NULL DEFAULT 'POS_Register',
+                correction_reason TEXT,
                 recorded_at TEXT NOT NULL,
                 recorded_by TEXT,
                 superseded_by_id TEXT,
@@ -149,6 +163,7 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
                 plate_waste_weight_kg REAL NOT NULL CHECK(plate_waste_weight_kg >= 0),
                 disposal_destination TEXT NOT NULL DEFAULT 'Compost',
                 measurement_method TEXT NOT NULL DEFAULT 'Digital_Scale',
+                correction_reason TEXT,
                 recorded_at TEXT NOT NULL,
                 recorded_by TEXT,
                 superseded_by_id TEXT,
@@ -165,6 +180,7 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
                 forecast_id TEXT PRIMARY KEY,
                 menu_entry_id TEXT NOT NULL,
                 forecast_timestamp TEXT NOT NULL,
+                cutoff_timestamp TEXT NOT NULL,
                 predicted_demand_portions REAL NOT NULL,
                 recommended_portions INTEGER NOT NULL,
                 final_adopted_portions INTEGER NOT NULL,
@@ -179,7 +195,7 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
             """
         )
 
-        # 9. Pilot_Audit_Log
+        # 9. Pilot_Audit_Log (No CASCADE delete to guarantee immutable history)
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS pilot_audit_logs (
@@ -187,19 +203,40 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
                 entity_type TEXT NOT NULL,
                 entity_id TEXT NOT NULL,
                 action TEXT NOT NULL,
+                old_value_json TEXT,
+                new_value_json TEXT,
+                correction_reason TEXT,
                 details TEXT,
                 performed_by TEXT,
+                auth_status TEXT DEFAULT 'unverified_client_claim',
                 timestamp TEXT NOT NULL
             );
             """
         )
 
+        # Indexes for query performance and data integrity
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_services_lookup ON meal_services(service_date, meal_period, canteen_section);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_meal_menus_lookup ON meal_menus(service_id, item_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_demand_obs_service ON demand_observations(service_id, observation_timestamp);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON pilot_audit_logs(entity_type, entity_id);")
+
         conn.commit()
 
 
-def reset_pilot_db(db_path: Optional[Path] = None) -> None:
-    """Drop and re-create pilot tables (used in isolated unit tests)."""
-    with get_pilot_connection(db_path) as conn:
+def reset_pilot_db(db_path: Optional[Path] = None, confirm_destructive: bool = False) -> None:
+    """Drop and re-create pilot tables.
+    
+    Requires explicit confirm_destructive=True to prevent accidental resets.
+    """
+    if not confirm_destructive:
+        raise PermissionError(
+            "Destructive database reset aborted: confirm_destructive must be set to True."
+        )
+
+    target_path = db_path or PILOT_DATABASE_PATH
+    validate_pilot_db_path(target_path)
+
+    with get_pilot_connection(target_path) as conn:
         cursor = conn.cursor()
         tables = [
             "pilot_audit_logs",
@@ -215,4 +252,5 @@ def reset_pilot_db(db_path: Optional[Path] = None) -> None:
         for t in tables:
             cursor.execute(f"DROP TABLE IF EXISTS {t};")
         conn.commit()
-    init_pilot_db(db_path)
+
+    init_pilot_db(target_path)

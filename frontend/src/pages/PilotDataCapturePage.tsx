@@ -511,13 +511,21 @@ export function PilotDataCapturePage() {
                       <div className="space-y-3">
                         <div className="p-3 bg-emerald-50/60 border border-emerald-100 rounded-xl flex items-center justify-between">
                           <div>
-                            <span className="text-xs text-neutral-500">Recorded Headcount:</span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs text-neutral-500">Recorded Headcount:</span>
+                              {serviceDetails.observations[0].is_late_entry && (
+                                <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-red-100 text-red-800 border border-red-200">
+                                  Late Entry (Post T-4h Cutoff)
+                                </span>
+                              )}
+                            </div>
                             <div className="text-xl font-bold text-[#24312B]">
                               {serviceDetails.observations[0].expected_headcount} guests
                             </div>
                             <span className="text-[11px] text-neutral-500">
                               Source: {serviceDetails.observations[0].observation_source} · Recorded by{' '}
-                              {serviceDetails.observations[0].recorded_by || 'Staff'}
+                              {serviceDetails.observations[0].recorded_by || 'Staff'} · Cutoff:{' '}
+                              {serviceDetails.observations[0].prediction_cutoff_timestamp?.slice(11, 16) || 'T-4h'}
                             </span>
                           </div>
                           <CheckCircle2 className="w-6 h-6 text-emerald-600" />
@@ -783,7 +791,7 @@ export function PilotDataCapturePage() {
                             {entry.production_records.map((rec) => (
                               <div key={rec.production_id} className="flex justify-between">
                                 <span>Batch {rec.batch_number}: {rec.portions_prepared} portions ({rec.prepared_weight_kg || 0} kg)</span>
-                                <span className="text-neutral-400">By {rec.logged_by || 'Staff'} · {rec.created_at.slice(11, 16)}</span>
+                                <span className="text-neutral-400">By {rec.logged_by || rec.recorded_by || 'Staff'} · {(rec.recorded_at || rec.created_at || '').slice(11, 16)}</span>
                               </div>
                             ))}
                           </div>
@@ -1327,11 +1335,13 @@ export function PilotDataCapturePage() {
               </div>
               <div className="p-3 bg-neutral-50 rounded-xl border border-[#E3E8E1]">
                 <span className="text-[11px] text-neutral-500 block">Logging Compliance</span>
-                <span className="text-lg font-bold text-[#245C46]">{qualityReport.logging_compliance_rate_pct}%</span>
+                <span className="text-lg font-bold text-[#245C46]">
+                  {(qualityReport.compliance_rate * 100).toFixed(1)}%
+                </span>
               </div>
               <div className="p-3 bg-neutral-50 rounded-xl border border-[#E3E8E1]">
                 <span className="text-[11px] text-neutral-500 block">Missing POS</span>
-                <span className="text-lg font-bold text-neutral-800">{qualityReport.services_with_missing_pos}</span>
+                <span className="text-lg font-bold text-neutral-800">{qualityReport.services_missing_pos_service}</span>
               </div>
             </div>
 
@@ -1341,41 +1351,49 @@ export function PilotDataCapturePage() {
                 Phase 6 Readiness Gates Evaluation
               </h4>
               <div className="space-y-2">
-                {qualityReport.readiness_gates.map((g) => (
-                  <div
-                    key={g.gate_id}
-                    className="p-3 rounded-xl border border-[#E3E8E1] flex items-center justify-between text-xs"
-                  >
-                    <div>
-                      <div className="font-semibold text-[#24312B] flex items-center gap-2">
-                        <span>{g.gate_name}</span>
-                        <span className="font-mono text-[10px] text-neutral-400">({g.gate_id})</span>
+                {qualityReport.readiness_gates.map((g) => {
+                  const badgeColor =
+                    g.status === 'MET'
+                      ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                      : g.status === 'BLOCKED'
+                      ? 'bg-amber-100 text-amber-800 border-amber-200'
+                      : g.status === 'NOT_STARTED'
+                      ? 'bg-neutral-100 text-neutral-700 border-neutral-200'
+                      : 'bg-red-100 text-red-800 border-red-200';
+
+                  return (
+                    <div
+                      key={g.gate_id}
+                      className="p-3 rounded-xl border border-[#E3E8E1] flex items-center justify-between text-xs"
+                    >
+                      <div>
+                        <div className="font-semibold text-[#24312B] flex items-center gap-2">
+                          <span>{g.name}</span>
+                          <span className="font-mono text-[10px] text-neutral-400">({g.gate_id})</span>
+                        </div>
+                        <div className="text-[11px] text-neutral-500 mt-0.5">{g.details}</div>
                       </div>
-                      <div className="text-[11px] text-neutral-500 mt-0.5">{g.details}</div>
+                      <div className="flex items-center gap-3">
+                        <span className="text-[11px] text-neutral-600">
+                          {g.current_value} / {g.required_value}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded-full font-bold text-[10px] border ${badgeColor}`}>
+                          {g.status}
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-[11px] text-neutral-600">
-                        {String(g.current_metric)} / {String(g.target_metric)}
-                      </span>
-                      <span
-                        className={`px-2 py-0.5 rounded-full font-bold text-[10px] ${
-                          g.is_met
-                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                            : 'bg-red-100 text-red-800 border border-red-200'
-                        }`}
-                      >
-                        {g.is_met ? 'MET' : 'BLOCKED'}
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 
             {/* Holdout Policy Notice */}
             <div className="p-3 bg-neutral-50 border border-[#E3E8E1] rounded-xl text-xs text-neutral-700">
               <strong className="text-[#24312B] block mb-0.5">Chronological Holdout Policy:</strong>
-              {qualityReport.holdout_policy.description}
+              {qualityReport.holdout_policy.policy_rule}
+              <div className="text-[11px] text-neutral-500 mt-1">
+                Historical Holdout: {qualityReport.holdout_policy.historical_holdout_status}
+              </div>
             </div>
 
             <div className="flex justify-end pt-2 border-t border-[#E3E8E1]">

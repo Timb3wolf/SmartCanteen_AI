@@ -1,5 +1,5 @@
 /**
- * Type definitions for SmartCanteen AI Phase 7 Operational Pilot Data Capture.
+ * Type definitions for SmartCanteen AI Phase 7 & 8 Operational Pilot Data Capture.
  */
 
 export interface MealService {
@@ -8,6 +8,11 @@ export interface MealService {
   meal_period: 'Breakfast' | 'Lunch' | 'Dinner';
   canteen_section: 'A' | 'B' | 'C' | 'D';
   status: 'Planned' | 'In_Prep' | 'Serving' | 'Closed' | 'Audited';
+  service_status?: string;
+  scheduled_start?: string;
+  scheduled_end?: string;
+  prediction_cutoff_time?: string;
+  service_timezone?: string;
   notes?: string | null;
   created_at: string;
   updated_at: string;
@@ -25,10 +30,13 @@ export interface MenuItem {
 export interface DemandObservation {
   observation_id: string;
   service_id: string;
-  cutoff_timestamp: string;
-  observation_source: 'Timetable' | 'Wifi_Count' | 'Preorder' | 'Historical_Average' | 'Kitchen_Estimate';
+  observation_timestamp?: string;
   expected_headcount: number;
-  confidence_score?: number | null;
+  observation_source: 'Timetable' | 'Wifi_Count' | 'Preorder' | 'Historical_Average' | 'Kitchen_Estimate' | string;
+  registered_reservations?: number;
+  is_late_entry?: boolean;
+  prediction_cutoff_timestamp?: string | null;
+  notes?: string | null;
   recorded_by?: string | null;
   recorded_at: string;
 }
@@ -39,9 +47,13 @@ export interface ProductionRecord {
   batch_number: number;
   portions_prepared: number;
   prepared_weight_kg?: number | null;
-  batch_completion_time?: string | null;
+  kitchen_station?: string;
+  correction_reason?: string | null;
   logged_by?: string | null;
-  created_at: string;
+  recorded_by?: string | null;
+  recorded_at?: string;
+  superseded_by_id?: string | null;
+  created_at?: string;
 }
 
 export interface ServiceRecord {
@@ -50,9 +62,14 @@ export interface ServiceRecord {
   portions_served: number;
   stockout_occurred: boolean;
   stockout_time?: string | null;
-  data_source: 'POS_Register' | 'Manual_Count';
+  gross_sales_amount?: number;
+  data_source: 'POS_Register' | 'Manual_Count' | 'POS_CSV_Import' | string;
+  correction_reason?: string | null;
   logged_by?: string | null;
-  created_at: string;
+  recorded_by?: string | null;
+  recorded_at?: string;
+  superseded_by_id?: string | null;
+  created_at?: string;
 }
 
 export interface WasteRecord {
@@ -60,10 +77,14 @@ export interface WasteRecord {
   menu_entry_id: string;
   unserved_surplus_weight_kg: number;
   plate_waste_weight_kg: number;
-  disposal_destination?: 'Compost' | 'Donation' | 'Landfill' | 'Anaerobic_Digestion' | null;
-  scale_id?: string | null;
+  disposal_destination?: 'Compost' | 'Donation' | 'Landfill' | 'Anaerobic_Digestion' | string | null;
+  measurement_method?: string;
+  correction_reason?: string | null;
   logged_by?: string | null;
-  created_at: string;
+  recorded_by?: string | null;
+  recorded_at?: string;
+  superseded_by_id?: string | null;
+  created_at?: string;
 }
 
 export interface MenuEntryDetail {
@@ -73,6 +94,8 @@ export interface MenuEntryDetail {
   food_category: string;
   standard_portion_grams: number;
   planned_portions?: number | null;
+  unit_price?: number;
+  ingredient_cost_per_portion?: number;
   total_portions_prepared: number;
   total_cooked_weight_kg: number;
   total_portions_served: number;
@@ -94,10 +117,14 @@ export interface ServiceDetails {
 
 export interface ReadinessGate {
   gate_id: string;
-  gate_name: string;
+  name: string;
+  description: string;
+  status: 'MET' | 'BLOCKED' | 'NOT_STARTED' | 'INVALID';
   is_met: boolean;
-  current_metric: string | number;
-  target_metric: string | number;
+  current_value: string;
+  required_value: string;
+  evidence_count?: number | null;
+  denominator?: number | null;
   details: string;
 }
 
@@ -105,25 +132,57 @@ export interface PilotQualityReport {
   pilot_section: string;
   pilot_meal_period: string;
   total_services_recorded: number;
+  target_services_count: number;
   complete_services_count: number;
-  logging_compliance_rate_pct: number;
-  services_with_missing_pos: number;
-  services_with_stockouts: number;
+  compliance_rate: number;
+  target_compliance_rate: number;
+  services_missing_headcount: number;
+  services_missing_production: number;
+  services_missing_pos_service: number;
+  services_missing_waste: number;
+  late_entries_count: number;
+  holdout_policy: {
+    reserve_days: number;
+    policy_rule: string;
+    holdout_gate_status?: string;
+    historical_holdout_status: string;
+  };
   readiness_gates: ReadinessGate[];
   is_pilot_ready_for_ml: boolean;
-  holdout_policy: {
-    status: string;
-    reserve_days: number;
-    rule: string;
-    description: string;
-  };
 }
 
 export interface POSImportResult {
   success: boolean;
+  total_rows_processed: number;
   imported_count: number;
   skipped_count: number;
   errors: string[];
   warnings: string[];
-  batch_timestamp: string;
+  accepted_row_indices?: number[];
+  rejected_rows?: Array<{ row: number; reason: string }>;
+}
+
+export interface ProductionCorrectionPayload {
+  portions_prepared: number;
+  prepared_weight_kg?: number;
+  kitchen_station?: string;
+  correction_reason: string;
+  corrected_by?: string;
+}
+
+export interface ServiceCorrectionPayload {
+  portions_served: number;
+  stockout_occurred: boolean;
+  stockout_time?: string;
+  gross_sales_amount: number;
+  correction_reason: string;
+  corrected_by?: string;
+}
+
+export interface WasteCorrectionPayload {
+  unserved_surplus_weight_kg: number;
+  plate_waste_weight_kg: number;
+  disposal_destination: string;
+  correction_reason: string;
+  corrected_by?: string;
 }

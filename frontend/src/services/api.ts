@@ -174,6 +174,9 @@ import type {
   ServiceDetails,
   PilotQualityReport,
   POSImportResult,
+  ProductionCorrectionPayload,
+  ServiceCorrectionPayload,
+  WasteCorrectionPayload,
 } from '../types/pilot';
 
 export async function fetchPilotServices(section?: string, limit: number = 50): Promise<MealService[]> {
@@ -370,7 +373,56 @@ export async function fetchPilotQualityReport(): Promise<PilotQualityReport> {
   return res.json();
 }
 
-export function getPilotExportUrl(): string {
-  return `${API_BASE}/pilot/export`;
+export function getPilotExportUrl(excludeHoldout: boolean = true): string {
+  return `${API_BASE}/pilot/export?exclude_holdout=${excludeHoldout}`;
 }
+
+export async function correctPilotProduction(
+  productionId: string,
+  payload: ProductionCorrectionPayload
+): Promise<ProductionRecord> {
+  const res = await fetch(`${API_BASE}/pilot/production/${encodeURIComponent(productionId)}/correct`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to correct production record');
+  }
+  return res.json();
+}
+
+export async function correctPilotService(
+  serviceRecordId: string,
+  payload: ServiceCorrectionPayload
+): Promise<ServiceRecord> {
+  const res = await fetch(`${API_BASE}/pilot/service-records/${encodeURIComponent(serviceRecordId)}/correct`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to correct service record');
+  }
+  return res.json();
+}
+
+export async function correctPilotWaste(
+  wasteId: string,
+  payload: WasteCorrectionPayload
+): Promise<WasteRecord> {
+  const res = await fetch(`${API_BASE}/pilot/waste/${encodeURIComponent(wasteId)}/correct`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to correct waste record');
+  }
+  return res.json();
+}
+
 
