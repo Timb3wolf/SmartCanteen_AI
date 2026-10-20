@@ -235,17 +235,13 @@ Once the **NO-GO** decision was locked, the holdout was evaluated once to confir
 
 ---
 
-## 7. Root Cause Analysis: The Bayes Optimal Error Floor
+## 7. Root Cause Analysis & Empirical Feature Limitations
 
 Why do complex models and ensembles fail to beat a simple constant mean predictor?
 
-In statistical decision theory, the Bayes optimal predictor under Mean Squared Error loss is the conditional expectation:
-$$f^*(X) = \mathbb{E}[Y \mid X]$$
-Under Mean Absolute Error loss, the Bayes optimal predictor is the conditional median:
-$$f^*(X) = \text{Median}(Y \mid X)$$
-
-If the conditioning features $X$ contain no mutual information with target variance $\text{Var}(Y \mid X) \approx \text{Var}(Y)$, then:
-$$\mathbb{E}[Y \mid X] = \mathbb{E}[Y]$$
+From an empirical decision-theoretic perspective:
+- When conditioning features $X$ have weak empirical association with the target variance ($\text{Var}(Y \mid X) \approx \text{Var}(Y)$), complex estimators struggle to improve upon the sample mean $\bar{Y}$.
+- While we cannot formally prove a mathematical "Bayes error floor" without knowing the true joint data-generating distribution $P(Y, X)$, the empirical evidence across 4 chronological development folds demonstrates that the existing feature set does not provide sufficient predictive signal to outperform a constant mean forecast.
 
 In the SmartCanteen AI dataset:
 1. **Missing Primary Causal Variables:** Food waste in institutional canteens is overwhelmingly determined by **operational variance**:
@@ -254,7 +250,7 @@ In the SmartCanteen AI dataset:
    - Remaining raw inventory and perishable shelf life.
    - Weather anomalies (e.g. torrential rain keeping students indoors).
 2. **Current Features Are Static Descriptors:** The current dataset contains `Meal` (Lunch/Dinner), `Canteen_Section`, `Food_Category`, `Unit_Price_per_kg`, and calendar timestamps. Across 61 days, average waste per meal type fluctuates around $\sim 2.5\text{ kg}$ with standard deviation $\sim 1.4\text{ kg}$.
-3. **Ensemble Multiplies Parameter Overhead Without Signal:** Ensembling (whether Random Forest averaging, gradient boosting, or stacking) can only reduce *variance* (estimation error) or *bias* (approximation error). It cannot reduce *irreducible Bayes error* caused by missing covariates. Combining two models that are both fitting noise simply produces another noisy estimator.
+3. **Ensemble Multiplies Parameter Overhead Without Signal:** Ensembling (whether Random Forest averaging, gradient boosting, or stacking) can only reduce estimation variance or model bias. It cannot manufacture missing causal signal when the underlying covariates do not capture the operational drivers of the target. Combining models that are fitting noisy residuals simply produces another noisy estimator.
 
 ---
 
