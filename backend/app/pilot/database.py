@@ -214,11 +214,33 @@ def init_pilot_db(db_path: Optional[Path] = None) -> None:
             """
         )
 
+        # 10. Holdout_Cohorts (Explicit, immutable evaluation cohort freezing)
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS holdout_cohorts (
+                cohort_id TEXT PRIMARY KEY,
+                pilot_id TEXT NOT NULL,
+                policy_name TEXT NOT NULL,
+                eligible_service_definition TEXT NOT NULL,
+                reserved_service_ids_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('RESERVED', 'SEALED', 'RELEASED')),
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                sealed_at TEXT,
+                sealed_by TEXT,
+                released_at TEXT,
+                released_by TEXT,
+                change_history_json TEXT NOT NULL
+            );
+            """
+        )
+
         # Indexes for query performance and data integrity
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_services_lookup ON meal_services(service_date, meal_period, canteen_section);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_meal_menus_lookup ON meal_menus(service_id, item_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_demand_obs_service ON demand_observations(service_id, observation_timestamp);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON pilot_audit_logs(entity_type, entity_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_holdout_cohorts_status ON holdout_cohorts(pilot_id, status);")
 
         conn.commit()
 
@@ -239,6 +261,7 @@ def reset_pilot_db(db_path: Optional[Path] = None, confirm_destructive: bool = F
     with get_pilot_connection(target_path) as conn:
         cursor = conn.cursor()
         tables = [
+            "holdout_cohorts",
             "pilot_audit_logs",
             "forecast_records",
             "waste_records",
@@ -254,3 +277,36 @@ def reset_pilot_db(db_path: Optional[Path] = None, confirm_destructive: bool = F
         conn.commit()
 
     init_pilot_db(target_path)
+
+
+def backup_pilot_db(source_db_path: Optional[Path] = None, dest_backup_path: Optional[Path] = None) -> Path:
+    """Safely back up the operational pilot database using SQLite's online backup API."""
+    from datetime import datetime, timezone
+    src = validate_pilot_db_path(source_db_path or PILOT_DATABASE_PATH)
+    if dest_backup_path is None:
+        from backend.app.pilot.config import PILOT_BACKUP_DIR
+        PILOT_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        dest_backup_path = PILOT_BACKUP_DIR / f"pilot_backup_{ts}.db"
+    dest_path = Path(dest_backup_path)
+    validate_pilot_db_path(dest_path)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with get_pilot_connection(src) as src_conn:
+        with sqlite3.connect(str(dest_path)) as dst_conn:
+            src_conn.backup(dst_conn)
+    return dest_path
+
+
+def restore_pilot_db(backup_source_path: Path, target_db_path: Optional[Path] = None) -> Path:
+    """Restore the pilot database from a verified backup file."""
+    src = Path(backup_source_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Backup file not found at '{src}'")
+    tgt = validate_pilot_db_path(target_db_path or PILOT_DATABASE_PATH)
+    tgt.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(str(src)) as src_conn:
+        with get_pilot_connection(tgt) as dst_conn:
+            src_conn.backup(dst_conn)
+    return tgt

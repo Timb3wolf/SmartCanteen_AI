@@ -362,3 +362,65 @@ class PilotQualityReportResponse(BaseModel):
     holdout_policy: Dict[str, Any]
     readiness_gates: List[ReadinessGateStatus]
     is_pilot_ready_for_ml: bool
+
+
+# =========================================================================
+# 12. Holdout Evaluation Cohort Schemas
+# =========================================================================
+
+class HoldoutCohortCreate(BaseModel):
+    policy_name: str = Field("Chronological_Final_10", description="Policy name governing holdout selection")
+    eligible_service_definition: str = Field(
+        "canteen_section = 'A' AND meal_period = 'Lunch'",
+        description="Filter definition for eligible services"
+    )
+    reserved_service_ids: List[str] = Field(..., min_length=1, description="Explicit frozen list of service IDs")
+    reason: str = Field(..., min_length=5, description="Administrative rationale for reserving this cohort")
+
+
+class HoldoutCohortUpdateRequest(BaseModel):
+    reserved_service_ids: List[str] = Field(..., min_length=1, description="Updated list of service IDs before sealing")
+    reason: str = Field(..., min_length=5, description="Administrative justification for cohort modification")
+
+
+class HoldoutCohortSealRequest(BaseModel):
+    reason: str = Field(..., min_length=5, description="Declaration statement freezing holdout immutability prior to ML analysis")
+
+
+class HoldoutCohortReleaseRequest(BaseModel):
+    reason: str = Field(..., min_length=5, description="Justification for releasing holdout observations for final one-shot evaluation")
+
+
+class HoldoutCohortResponse(BaseModel):
+    cohort_id: str
+    pilot_id: str
+    policy_name: str
+    eligible_service_definition: str
+    reserved_service_ids: List[str]
+    status: Literal["RESERVED", "SEALED", "RELEASED"]
+    created_at: str
+    created_by: str
+    sealed_at: Optional[str] = None
+    sealed_by: Optional[str] = None
+    released_at: Optional[str] = None
+    released_by: Optional[str] = None
+    change_history: List[Dict[str, Any]] = []
+
+
+# =========================================================================
+# 13. Authentication & Token Exchange Schemas
+# =========================================================================
+
+class TokenRequest(BaseModel):
+    actor_id: str = Field(..., min_length=2, description="Staff badge ID or username")
+    role: str = Field("staff", description="Requested role: staff, supervisor, auditor, admin")
+    secret: Optional[str] = Field(None, description="Optional access secret or badge PIN")
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in_seconds: int
+    actor_id: str
+    role: str
+

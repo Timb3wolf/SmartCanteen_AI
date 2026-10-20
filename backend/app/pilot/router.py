@@ -1,12 +1,17 @@
 """FastAPI Router for the SmartCanteen AI Pilot Data Capture API.
 
 Hardened with:
+- Strict Token Authentication & Role-Based Access Control (RBAC):
+  * staff: Service scheduling, menu allocation, demand observation, initial kitchen/service/waste logging.
+  * supervisor: Staff actions + auditable record corrections + POS CSV register ingestion.
+  * auditor: Read-only visibility over quality metrics, services, and pre-service features.
+  * admin: Master catalog dish registration, holdout cohort sealing/reservation, raw data exports.
 - Payload size enforcement on CSV uploads (max 2 MB, HTTP 413)
-- Auditable record correction endpoints
+- Auditable record correction endpoints enforcing mandatory justification
 - Pre-service feature retrieval endpoint (strictly pre-cutoff)
-- Immutable forecast record capture endpoint
-- Holdout-protected dataset export
-- Auth token inspection and unverified actor tagging
+- Immutable forecast record capture endpoint with frozen pre-service snapshot
+- Explicit Holdout Cohort reservation, update, sealing, and release endpoints
+- Holdout-protected dataset export with access auditing
 """
 
 import json
@@ -14,12 +19,32 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 
-from backend.app.pilot.config import MAX_POS_CSV_SIZE_BYTES
+from backend.app.pilot.auth import (
+    AuthenticatedActor,
+    Role,
+    create_access_token,
+    get_current_actor,
+    require_admin,
+    require_any_authenticated,
+    require_auditor,
+    require_role,
+    require_staff,
+    require_supervisor,
+)
+from backend.app.pilot.config import (
+    MAX_POS_CSV_SIZE_BYTES,
+    PILOT_ACCESS_TOKEN_EXPIRE_MINUTES,
+)
 from backend.app.pilot.schemas import (
     DemandObservationCreate,
     DemandObservationResponse,
     ForecastRecordCreate,
     ForecastRecordResponse,
+    HoldoutCohortCreate,
+    HoldoutCohortReleaseRequest,
+    HoldoutCohortResponse,
+    HoldoutCohortSealRequest,
+    HoldoutCohortUpdateRequest,
     MealMenuCreate,
     MealMenuResponse,
     MealServiceCreate,
@@ -27,7 +52,6 @@ from backend.app.pilot.schemas import (
     MealServiceStatusUpdate,
     MenuItemCreate,
     MenuItemResponse,
-    POSImportPayload,
     POSImportResponse,
     PilotQualityReportResponse,
     PreServiceFeaturesResponse,
@@ -38,6 +62,8 @@ from backend.app.pilot.schemas import (
     ServiceRecordCorrectionRequest,
     ServiceRecordCreate,
     ServiceRecordResponse,
+    TokenRequest,
+    TokenResponse,
     WasteRecordCorrectionRequest,
     WasteRecordCreate,
     WasteRecordResponse,
@@ -54,18 +80,40 @@ def get_pilot_service() -> PilotDataService:
 
 
 def extract_actor(
-    x_staff_auth_token: Optional[str] = Header(None, alias="X-Staff-Auth-Token"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    actor: AuthenticatedActor = Depends(get_current_actor),
 ) -> Tuple[str, str]:
-    """Extract staff actor identity and verify authentication status.
+    """Extract staff actor identity and verified authentication status from token.
     
-    If no verified session token is provided, returns ('unverified_staff', 'unverified_client_claim').
+    Provided for backward compatibility with existing internal service callers.
     """
-    token = x_staff_auth_token or authorization
-    if token and len(token) > 8:
-        # Simple token presence indicator for pilot; real production requires OAuth/IdP
-        return (f"staff_token_{token[:6]}", "bearer_token_verified")
-    return ("staff", "unverified_client_claim")
+    auth_status = "bearer_token_verified" if actor.is_authenticated else "unverified_client_claim"
+    return (actor.actor_id, auth_status)
+
+
+# =========================================================================
+# 0. Authentication & Token Exchange
+# =========================================================================
+
+@router.post("/auth/token", response_model=TokenResponse)
+def generate_staff_token(req: TokenRequest):
+    """Issue a signed HS256 JWT access token for operational staff or testing.
+    
+    In a physical deployment, this is superseded by the enterprise Identity Provider / SSO.
+    """
+    valid_roles = [r.value for r in Role]
+    if req.role not in valid_roles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid role '{req.role}'. Must be one of: {valid_roles}",
+        )
+    token = create_access_token(actor_id=req.actor_id, role=req.role)
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in_seconds=PILOT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        actor_id=req.actor_id,
+        role=req.role,
+    )
 
 
 # =========================================================================
@@ -80,6 +128,7 @@ def list_meal_services(
     status: Optional[str] = Query(None, description="Planned, In_Prep, Serving, Closed, Audited"),
     limit: int = Query(100, ge=1, le=500),
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_any_authenticated),
 ):
     """List operational meal services with optional filters."""
     return service.get_meal_services(
@@ -95,11 +144,11 @@ def list_meal_services(
 def create_meal_service(
     req: MealServiceCreate,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
-    """Schedule a new meal service event."""
+    """Schedule a new meal service event (staff, supervisor, admin)."""
     try:
-        return service.create_meal_service(req, performed_by=actor[0])
+        return service.create_meal_service(req, performed_by=actor.actor_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -108,6 +157,7 @@ def create_meal_service(
 def get_service_details(
     service_id: str,
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_any_authenticated),
 ):
     """Retrieve full service details including menu, production, POS, and waste records."""
     try:
@@ -121,12 +171,12 @@ def update_service_status(
     service_id: str,
     req: MealServiceStatusUpdate,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
     """Update service status (e.g. advance from Serving to Closed or Audited)."""
     try:
         return service.update_service_status(
-            service_id, req.status, notes=req.notes, performed_by=req.updated_by or actor[0]
+            service_id, req.status, notes=req.notes, performed_by=req.updated_by or actor.actor_id
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -136,6 +186,7 @@ def update_service_status(
 def get_preservice_features(
     service_id: str,
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_any_authenticated),
 ):
     """Retrieve pre-service features strictly prior to prediction cutoff (leakage-safe)."""
     try:
@@ -145,26 +196,29 @@ def get_preservice_features(
 
 
 # =========================================================================
-# 2. Master Menu Items & Service Menus
+# 2. Master Menu Items Catalog & Daily Menus
 # =========================================================================
-
-@router.get("/menu-items", response_model=List[MenuItemResponse])
-def list_menu_items(service: PilotDataService = Depends(get_pilot_service)):
-    """List all dishes in the master menu catalog."""
-    return service.get_menu_items()
-
 
 @router.post("/menu-items", response_model=MenuItemResponse, status_code=status.HTTP_201_CREATED)
 def create_menu_item(
     req: MenuItemCreate,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_admin),
 ):
-    """Register a new dish recipe in the master catalog."""
+    """Register a new standardized dish in the master catalog (admin only)."""
     try:
-        return service.create_menu_item(req, performed_by=actor[0])
+        return service.create_menu_item(req, performed_by=actor.actor_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/menu-items", response_model=List[MenuItemResponse])
+def get_menu_items(
+    service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_any_authenticated),
+):
+    """List all available standardized dishes."""
+    return service.get_menu_items()
 
 
 @router.post("/services/{service_id}/menu", response_model=MealMenuResponse, status_code=status.HTTP_201_CREATED)
@@ -172,17 +226,17 @@ def add_menu_to_service(
     service_id: str,
     req: MealMenuCreate,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
-    """Schedule a dish item on a specific meal service."""
+    """Schedule a dish from catalog to a specific meal service."""
     try:
-        return service.add_menu_to_service(service_id, req, performed_by=actor[0])
+        return service.add_menu_to_service(service_id, req, performed_by=actor.actor_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 # =========================================================================
-# 3. Pre-Service Demand Observations
+# 3. Demand Observations
 # =========================================================================
 
 @router.post("/services/{service_id}/observations", response_model=DemandObservationResponse, status_code=status.HTTP_201_CREATED)
@@ -190,6 +244,7 @@ def record_demand_observation(
     service_id: str,
     req: DemandObservationCreate,
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
     """Log pre-service expected headcount with automatic late-entry detection."""
     try:
@@ -207,6 +262,7 @@ def record_production(
     menu_entry_id: str,
     req: ProductionRecordCreate,
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
     """Log batch cooking portion count and measured cooked weight."""
     try:
@@ -220,11 +276,11 @@ def correct_production(
     production_id: str,
     req: ProductionRecordCorrectionRequest,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_supervisor),
 ):
-    """Auditably correct a previously recorded production entry."""
+    """Auditably correct a previously recorded production entry (supervisor or admin only)."""
     try:
-        return service.correct_production_record(production_id, req, performed_by=actor[0])
+        return service.correct_production_record(production_id, req, performed_by=actor.actor_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -234,6 +290,7 @@ def record_service(
     menu_entry_id: str,
     req: ServiceRecordCreate,
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
     """Log POS portions dispensed and any early stockout occurrence."""
     try:
@@ -247,11 +304,11 @@ def correct_service_record(
     service_record_id: str,
     req: ServiceRecordCorrectionRequest,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_supervisor),
 ):
-    """Auditably correct a previously recorded portions-served entry."""
+    """Auditably correct a previously recorded portions-served entry (supervisor or admin only)."""
     try:
-        return service.correct_service_record(service_record_id, req, performed_by=actor[0])
+        return service.correct_service_record(service_record_id, req, performed_by=actor.actor_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -261,6 +318,7 @@ def record_waste(
     menu_entry_id: str,
     req: WasteRecordCreate,
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
     """Log post-service unserved kitchen surplus and customer plate waste separately."""
     try:
@@ -274,11 +332,11 @@ def correct_waste_record(
     waste_id: str,
     req: WasteRecordCorrectionRequest,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_supervisor),
 ):
-    """Auditably correct a previously recorded waste measurement."""
+    """Auditably correct a previously recorded waste measurement (supervisor or admin only)."""
     try:
-        return service.correct_waste_record(waste_id, req, performed_by=actor[0])
+        return service.correct_waste_record(waste_id, req, performed_by=actor.actor_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -291,11 +349,11 @@ def correct_waste_record(
 def record_forecast(
     req: ForecastRecordCreate,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_staff),
 ):
     """Record an operational demand forecast with frozen pre-service snapshot."""
     try:
-        return service.create_forecast_record(req, performed_by=actor[0])
+        return service.create_forecast_record(req, performed_by=actor.actor_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -308,10 +366,9 @@ def record_forecast(
 async def import_pos_file(
     request: Request,
     service: PilotDataService = Depends(get_pilot_service),
-    actor: Tuple[str, str] = Depends(extract_actor),
+    actor: AuthenticatedActor = Depends(require_supervisor),
 ):
-    """Import and validate an end-of-day POS transaction CSV with strict payload bounds."""
-    # Check Content-Length header if present
+    """Import and validate an end-of-day POS transaction CSV (supervisor or admin only)."""
     content_length = request.headers.get("content-length")
     if content_length and int(content_length) > MAX_POS_CSV_SIZE_BYTES:
         raise HTTPException(
@@ -349,8 +406,7 @@ async def import_pos_file(
     if not content_str:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty CSV content.")
 
-    performed_by = actor[0] if actor[0] != "staff" else "api_import"
-    res = service.import_pos_csv(content_str, performed_by=performed_by)
+    res = service.import_pos_csv(content_str, performed_by=actor.actor_id)
     return res
 
 
@@ -359,7 +415,10 @@ async def import_pos_file(
 # =========================================================================
 
 @router.get("/quality-report", response_model=PilotQualityReportResponse)
-def get_pilot_quality_report(service: PilotDataService = Depends(get_pilot_service)):
+def get_pilot_quality_report(
+    service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_any_authenticated),
+):
     """Retrieve data quality summary, logging compliance rate, and 4-state Phase 6 readiness gates."""
     return service.get_quality_report()
 
@@ -368,9 +427,10 @@ def get_pilot_quality_report(service: PilotDataService = Depends(get_pilot_servi
 def export_pilot_records(
     exclude_holdout: bool = Query(True, description="Strictly exclude final 10 holdout services"),
     service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_role([Role.SUPERVISOR, Role.ADMIN, Role.AUDITOR])),
 ):
     """Export validated, reconciled pilot records as JSON with holdout protection."""
-    records = service.export_flat_dataset(exclude_holdout=exclude_holdout)
+    records = service.export_flat_dataset(exclude_holdout=exclude_holdout, performed_by=actor.actor_id)
     return JSONResponse(
         content={
             "pilot_section": "A",
@@ -380,3 +440,75 @@ def export_pilot_records(
             "records": records,
         }
     )
+
+
+# =========================================================================
+# 8. Holdout Evaluation Cohort Endpoints
+# =========================================================================
+
+@router.post("/holdout/reserve", response_model=HoldoutCohortResponse, status_code=status.HTTP_201_CREATED)
+def reserve_holdout_cohort(
+    req: HoldoutCohortCreate,
+    service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_admin),
+):
+    """Reserve an explicit list of meal service IDs as the immutable holdout cohort (admin only)."""
+    try:
+        return service.reserve_holdout_cohort(req, performed_by=actor.actor_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.patch("/holdout/{cohort_id}", response_model=HoldoutCohortResponse)
+def update_holdout_cohort(
+    cohort_id: str,
+    req: HoldoutCohortUpdateRequest,
+    service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_admin),
+):
+    """Update reserved service IDs prior to sealing with mandatory audit justification (admin only)."""
+    try:
+        return service.update_holdout_cohort(cohort_id, req, performed_by=actor.actor_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/holdout/{cohort_id}/seal", response_model=HoldoutCohortResponse)
+def seal_holdout_cohort(
+    cohort_id: str,
+    req: HoldoutCohortSealRequest,
+    service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_admin),
+):
+    """Permanently seal holdout cohort, rendering it strictly immutable (admin only)."""
+    try:
+        return service.seal_holdout_cohort(cohort_id, req, performed_by=actor.actor_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/holdout/{cohort_id}/release", response_model=HoldoutCohortResponse)
+def release_holdout_cohort(
+    cohort_id: str,
+    req: HoldoutCohortReleaseRequest,
+    service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_admin),
+):
+    """Release sealed holdout cohort for final one-shot benchmark evaluation (admin only)."""
+    try:
+        return service.release_holdout_cohort(cohort_id, req, performed_by=actor.actor_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/holdout", response_model=Optional[HoldoutCohortResponse])
+def get_holdout_cohort(
+    cohort_id: Optional[str] = Query(None, description="Optional specific cohort ID"),
+    service: PilotDataService = Depends(get_pilot_service),
+    actor: AuthenticatedActor = Depends(require_any_authenticated),
+):
+    """Retrieve active or specific holdout cohort record."""
+    cohort = service.get_holdout_cohort(cohort_id)
+    if not cohort and cohort_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Cohort '{cohort_id}' not found.")
+    return cohort

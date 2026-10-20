@@ -35,6 +35,11 @@ from backend.app.pilot.schemas import (
     DemandObservationResponse,
     ForecastRecordCreate,
     ForecastRecordResponse,
+    HoldoutCohortCreate,
+    HoldoutCohortReleaseRequest,
+    HoldoutCohortResponse,
+    HoldoutCohortSealRequest,
+    HoldoutCohortUpdateRequest,
     MealMenuCreate,
     MealServiceCreate,
     MenuItemCreate,
@@ -1461,9 +1466,47 @@ class PilotDataService:
                 g5_status = "BLOCKED"
                 g5_is_met = False
 
+            # Query active holdout cohort if any
+            cursor.execute(
+                """
+                SELECT cohort_id, policy_name, eligible_service_definition, reserved_service_ids_json, status, sealed_at
+                FROM holdout_cohorts
+                ORDER BY CASE status WHEN 'SEALED' THEN 1 WHEN 'RESERVED' THEN 2 ELSE 3 END, created_at DESC
+                LIMIT 1
+                """
+            )
+            cohort_row = cursor.fetchone()
+            cohort_status = "NOT_RESERVED"
+            reserved_service_ids = []
+            observed_holdout_count = 0
+            if cohort_row:
+                cohort_status = cohort_row["status"]
+                reserved_service_ids = json.loads(cohort_row["reserved_service_ids_json"])
+                if reserved_service_ids:
+                    placeholders = ",".join("?" for _ in reserved_service_ids)
+                    cursor.execute(
+                        f"""
+                        SELECT COUNT(*) as c FROM meal_services
+                        WHERE service_id IN ({placeholders}) AND service_status IN ('Closed', 'Audited')
+                        """,
+                        reserved_service_ids,
+                    )
+                    observed_holdout_count = cursor.fetchone()["c"]
+
             # Gate 6: G6_HOLDOUT_POLICY
-            # Distinguish policy documentation (established) from real observation reservation
-            if total_services < 31:
+            if cohort_status == "SEALED" and observed_holdout_count >= PILOT_HOLDOUT_RESERVE_DAYS:
+                g6_status = "MET"
+                g6_is_met = True
+                g6_details = f"Evaluation cohort is SEALED and immutable ({len(reserved_service_ids)} services reserved, {observed_holdout_count} observed)."
+            elif cohort_status == "SEALED":
+                g6_status = "BLOCKED"
+                g6_is_met = False
+                g6_details = f"Evaluation cohort is SEALED ({len(reserved_service_ids)} services frozen), but only {observed_holdout_count}/{PILOT_HOLDOUT_RESERVE_DAYS} services have been completed."
+            elif cohort_status == "RESERVED":
+                g6_status = "BLOCKED"
+                g6_is_met = False
+                g6_details = f"Evaluation cohort is RESERVED ({len(reserved_service_ids)} services) but awaiting administrative SEAL."
+            elif total_services < 31:
                 g6_status = "BLOCKED"
                 g6_is_met = False
                 g6_details = f"Holdout policy formalized, but real-service count ({total_services}) is below 31. Awaiting Services 31-40."
@@ -1541,9 +1584,9 @@ class PilotDataService:
                     description=f"Final {PILOT_HOLDOUT_RESERVE_DAYS} pilot services permanently sealed for final evaluation.",
                     status=g6_status,
                     is_met=g6_is_met,
-                    current_value=f"{min(total_services, PILOT_HOLDOUT_RESERVE_DAYS)}/10 holdout services" if total_services >= 30 else "Awaiting services",
+                    current_value=f"{observed_holdout_count}/{PILOT_HOLDOUT_RESERVE_DAYS} holdout services" if cohort_row else (f"{min(total_services, PILOT_HOLDOUT_RESERVE_DAYS)}/10 holdout services" if total_services >= 30 else "Awaiting services"),
                     required_value=f"Sealed ({PILOT_HOLDOUT_RESERVE_DAYS} days)",
-                    evidence_count=max(0, total_services - 30),
+                    evidence_count=observed_holdout_count if cohort_row else max(0, total_services - 30),
                     denominator=PILOT_HOLDOUT_RESERVE_DAYS,
                     details=g6_details,
                 ),
@@ -1567,6 +1610,9 @@ class PilotDataService:
                 holdout_policy={
                     "reserve_days": PILOT_HOLDOUT_RESERVE_DAYS,
                     "policy_rule": "Final 10 chronological pilot services (Services 31-40) sealed until model selection is frozen.",
+                    "cohort_status": cohort_status,
+                    "reserved_service_count": len(reserved_service_ids),
+                    "observed_holdout_count": observed_holdout_count,
                     "holdout_gate_status": g6_status,
                     "historical_holdout_status": "Disqualified (August 4-10, 2025 permanently contaminated).",
                 },
@@ -1578,28 +1624,47 @@ class PilotDataService:
     # 9. Data Export with Holdout Protection
     # =========================================================================
 
-    def export_flat_dataset(self, exclude_holdout: bool = True) -> List[Dict[str, Any]]:
+    def export_flat_dataset(
+        self, exclude_holdout: bool = True, performed_by: Optional[str] = "system"
+    ) -> List[Dict[str, Any]]:
         """Export reconciled pilot records in flat format with strict holdout protection."""
         with get_pilot_connection(self.db_path) as conn:
             cursor = conn.cursor()
+            holdout_service_ids: Set[str] = set()
+            cohort_id_found = None
 
-            # First determine chronological service ranks for Section A Lunch
+            # Check if an explicit holdout cohort is registered
             cursor.execute(
                 """
-                SELECT service_id, service_date, scheduled_start
-                FROM meal_services
-                WHERE canteen_section = ? AND meal_period = ?
-                ORDER BY service_date ASC, scheduled_start ASC
-                """,
-                (PILOT_TARGET_SECTION, PILOT_TARGET_MEAL),
+                SELECT cohort_id, reserved_service_ids_json, status
+                FROM holdout_cohorts
+                WHERE status IN ('SEALED', 'RESERVED')
+                ORDER BY CASE status WHEN 'SEALED' THEN 1 ELSE 2 END, created_at DESC
+                LIMIT 1
+                """
             )
-            all_services = cursor.fetchall()
-            holdout_service_ids: Set[str] = set()
+            cohort_row = cursor.fetchone()
 
-            if exclude_holdout and len(all_services) > 30:
-                # Services from index 30 onwards (31st to 40th service) are sealed holdout
-                for s in all_services[30:]:
-                    holdout_service_ids.add(s["service_id"])
+            if cohort_row:
+                cohort_id_found = cohort_row["cohort_id"]
+                frozen_ids = json.loads(cohort_row["reserved_service_ids_json"])
+                if exclude_holdout:
+                    holdout_service_ids = set(frozen_ids)
+            else:
+                # Fallback policy: services from index 30 onwards if > 30 exist
+                cursor.execute(
+                    """
+                    SELECT service_id, service_date, scheduled_start
+                    FROM meal_services
+                    WHERE canteen_section = ? AND meal_period = ?
+                    ORDER BY service_date ASC, scheduled_start ASC
+                    """,
+                    (PILOT_TARGET_SECTION, PILOT_TARGET_MEAL),
+                )
+                all_services = cursor.fetchall()
+                if exclude_holdout and len(all_services) > 30:
+                    for s in all_services[30:]:
+                        holdout_service_ids.add(s["service_id"])
 
             cursor.execute(
                 """
@@ -1634,9 +1699,371 @@ class PilotDataService:
             )
             raw_rows = [dict(r) for r in cursor.fetchall()]
 
-            # Filter out holdout records if requested
             filtered_rows = [
                 r for r in raw_rows if r["service_id"] not in holdout_service_ids
             ]
 
+        # Audit if holdout data was requested without protection
+        if not exclude_holdout:
+            self._log_audit(
+                "Holdout_Cohort",
+                cohort_id_found or "unreserved_cohort",
+                "HOLDOUT_ACCESS",
+                details={
+                    "total_exported": len(filtered_rows),
+                    "holdout_protection": False,
+                },
+                performed_by=performed_by,
+            )
+
         return filtered_rows
+
+    # =========================================================================
+    # 10. Holdout Cohort Management (Explicit, Immutable Evaluation Cohort)
+    # =========================================================================
+
+    def reserve_holdout_cohort(
+        self,
+        req: HoldoutCohortCreate,
+        performed_by: Optional[str] = "admin",
+    ) -> Dict[str, Any]:
+        """Reserve an explicit list of meal service IDs as the immutable holdout cohort."""
+        cohort_id = f"cohort_{uuid.uuid4().hex[:8]}"
+        now_utc = datetime.now(timezone.utc).isoformat()
+
+        with get_pilot_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Check if there is already a SEALED cohort
+            cursor.execute("SELECT cohort_id, status FROM holdout_cohorts WHERE status = 'SEALED'")
+            sealed_cohort = cursor.fetchone()
+            if sealed_cohort:
+                raise ValueError(
+                    f"Cannot reserve new cohort: Cohort '{sealed_cohort['cohort_id']}' is already SEALED and strictly immutable."
+                )
+
+            # Validate that all requested service_ids exist
+            placeholders = ",".join("?" for _ in req.reserved_service_ids)
+            cursor.execute(
+                f"SELECT service_id FROM meal_services WHERE service_id IN ({placeholders})",
+                req.reserved_service_ids,
+            )
+            found_ids = {r["service_id"] for r in cursor.fetchall()}
+            missing_ids = set(req.reserved_service_ids) - found_ids
+            if missing_ids:
+                raise ValueError(f"Cannot reserve holdout: Service IDs do not exist: {sorted(list(missing_ids))}")
+
+            initial_history = [
+                {
+                    "timestamp": now_utc,
+                    "action": "RESERVE",
+                    "actor": performed_by,
+                    "reason": req.reason,
+                    "service_count": len(req.reserved_service_ids),
+                }
+            ]
+
+            cursor.execute(
+                """
+                INSERT INTO holdout_cohorts (
+                    cohort_id, pilot_id, policy_name, eligible_service_definition,
+                    reserved_service_ids_json, status, created_at, created_by,
+                    change_history_json
+                ) VALUES (?, ?, ?, ?, ?, 'RESERVED', ?, ?, ?)
+                """,
+                (
+                    cohort_id,
+                    "pilot_section_a_lunch",
+                    req.policy_name,
+                    req.eligible_service_definition,
+                    json.dumps(req.reserved_service_ids),
+                    now_utc,
+                    performed_by,
+                    json.dumps(initial_history),
+                ),
+            )
+            conn.commit()
+
+        self._log_audit(
+            "Holdout_Cohort",
+            cohort_id,
+            "RESERVE",
+            details={
+                "policy_name": req.policy_name,
+                "reserved_count": len(req.reserved_service_ids),
+                "reason": req.reason,
+            },
+            performed_by=performed_by,
+        )
+
+        return {
+            "cohort_id": cohort_id,
+            "pilot_id": "pilot_section_a_lunch",
+            "policy_name": req.policy_name,
+            "eligible_service_definition": req.eligible_service_definition,
+            "reserved_service_ids": req.reserved_service_ids,
+            "status": "RESERVED",
+            "created_at": now_utc,
+            "created_by": performed_by,
+            "sealed_at": None,
+            "sealed_by": None,
+            "released_at": None,
+            "released_by": None,
+            "change_history": initial_history,
+        }
+
+    def update_holdout_cohort(
+        self,
+        cohort_id: str,
+        req: HoldoutCohortUpdateRequest,
+        performed_by: Optional[str] = "admin",
+    ) -> Dict[str, Any]:
+        """Update reserved service IDs prior to sealing with mandatory audit justification."""
+        now_utc = datetime.now(timezone.utc).isoformat()
+
+        with get_pilot_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM holdout_cohorts WHERE cohort_id = ?", (cohort_id,))
+            cohort = cursor.fetchone()
+            if not cohort:
+                raise ValueError(f"Holdout cohort '{cohort_id}' does not exist.")
+
+            if cohort["status"] == "SEALED":
+                raise ValueError(
+                    f"Holdout cohort '{cohort_id}' is SEALED and strictly immutable. Changes to reserved service IDs are prohibited."
+                )
+            if cohort["status"] == "RELEASED":
+                raise ValueError(f"Holdout cohort '{cohort_id}' has already been RELEASED.")
+
+            # Validate that all requested service_ids exist
+            placeholders = ",".join("?" for _ in req.reserved_service_ids)
+            cursor.execute(
+                f"SELECT service_id FROM meal_services WHERE service_id IN ({placeholders})",
+                req.reserved_service_ids,
+            )
+            found_ids = {r["service_id"] for r in cursor.fetchall()}
+            missing_ids = set(req.reserved_service_ids) - found_ids
+            if missing_ids:
+                raise ValueError(f"Cannot update holdout: Service IDs do not exist: {sorted(list(missing_ids))}")
+
+            history = json.loads(cohort["change_history_json"])
+            history.append(
+                {
+                    "timestamp": now_utc,
+                    "action": "UPDATE",
+                    "actor": performed_by,
+                    "reason": req.reason,
+                    "old_service_count": len(json.loads(cohort["reserved_service_ids_json"])),
+                    "new_service_count": len(req.reserved_service_ids),
+                }
+            )
+
+            cursor.execute(
+                """
+                UPDATE holdout_cohorts
+                SET reserved_service_ids_json = ?, change_history_json = ?
+                WHERE cohort_id = ?
+                """,
+                (json.dumps(req.reserved_service_ids), json.dumps(history), cohort_id),
+            )
+            conn.commit()
+
+        self._log_audit(
+            "Holdout_Cohort",
+            cohort_id,
+            "UPDATE",
+            details={
+                "reason": req.reason,
+                "new_service_count": len(req.reserved_service_ids),
+            },
+            performed_by=performed_by,
+        )
+
+        return {
+            "cohort_id": cohort_id,
+            "pilot_id": cohort["pilot_id"],
+            "policy_name": cohort["policy_name"],
+            "eligible_service_definition": cohort["eligible_service_definition"],
+            "reserved_service_ids": req.reserved_service_ids,
+            "status": cohort["status"],
+            "created_at": cohort["created_at"],
+            "created_by": cohort["created_by"],
+            "sealed_at": cohort["sealed_at"],
+            "sealed_by": cohort["sealed_by"],
+            "released_at": cohort["released_at"],
+            "released_by": cohort["released_by"],
+            "change_history": history,
+        }
+
+    def seal_holdout_cohort(
+        self,
+        cohort_id: str,
+        req: HoldoutCohortSealRequest,
+        performed_by: Optional[str] = "admin",
+    ) -> Dict[str, Any]:
+        """Permanently seal holdout cohort, rendering it strictly immutable."""
+        now_utc = datetime.now(timezone.utc).isoformat()
+
+        with get_pilot_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM holdout_cohorts WHERE cohort_id = ?", (cohort_id,))
+            cohort = cursor.fetchone()
+            if not cohort:
+                raise ValueError(f"Holdout cohort '{cohort_id}' does not exist.")
+
+            if cohort["status"] == "SEALED":
+                raise ValueError(f"Cohort '{cohort_id}' is already sealed.")
+
+            reserved_ids = json.loads(cohort["reserved_service_ids_json"])
+            if len(reserved_ids) < PILOT_HOLDOUT_RESERVE_DAYS:
+                raise ValueError(
+                    f"Cannot seal holdout cohort: Requires at least {PILOT_HOLDOUT_RESERVE_DAYS} services, but holds {len(reserved_ids)}."
+                )
+
+            history = json.loads(cohort["change_history_json"])
+            history.append(
+                {
+                    "timestamp": now_utc,
+                    "action": "SEAL",
+                    "actor": performed_by,
+                    "reason": req.reason,
+                    "sealed_service_count": len(reserved_ids),
+                }
+            )
+
+            cursor.execute(
+                """
+                UPDATE holdout_cohorts
+                SET status = 'SEALED', sealed_at = ?, sealed_by = ?, change_history_json = ?
+                WHERE cohort_id = ?
+                """,
+                (now_utc, performed_by, json.dumps(history), cohort_id),
+            )
+            conn.commit()
+
+        self._log_audit(
+            "Holdout_Cohort",
+            cohort_id,
+            "SEAL",
+            details={
+                "reason": req.reason,
+                "sealed_services_count": len(reserved_ids),
+            },
+            performed_by=performed_by,
+        )
+
+        return {
+            "cohort_id": cohort_id,
+            "pilot_id": cohort["pilot_id"],
+            "policy_name": cohort["policy_name"],
+            "eligible_service_definition": cohort["eligible_service_definition"],
+            "reserved_service_ids": reserved_ids,
+            "status": "SEALED",
+            "created_at": cohort["created_at"],
+            "created_by": cohort["created_by"],
+            "sealed_at": now_utc,
+            "sealed_by": performed_by,
+            "released_at": cohort["released_at"],
+            "released_by": cohort["released_by"],
+            "change_history": history,
+        }
+
+    def release_holdout_cohort(
+        self,
+        cohort_id: str,
+        req: HoldoutCohortReleaseRequest,
+        performed_by: Optional[str] = "admin",
+    ) -> Dict[str, Any]:
+        """Release sealed holdout cohort for final one-shot benchmark evaluation."""
+        now_utc = datetime.now(timezone.utc).isoformat()
+
+        with get_pilot_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM holdout_cohorts WHERE cohort_id = ?", (cohort_id,))
+            cohort = cursor.fetchone()
+            if not cohort:
+                raise ValueError(f"Holdout cohort '{cohort_id}' does not exist.")
+
+            if cohort["status"] != "SEALED":
+                raise ValueError(
+                    f"Cannot release holdout cohort: Must be in 'SEALED' status, but is '{cohort['status']}'."
+                )
+
+            history = json.loads(cohort["change_history_json"])
+            history.append(
+                {
+                    "timestamp": now_utc,
+                    "action": "RELEASE",
+                    "actor": performed_by,
+                    "reason": req.reason,
+                }
+            )
+
+            cursor.execute(
+                """
+                UPDATE holdout_cohorts
+                SET status = 'RELEASED', released_at = ?, released_by = ?, change_history_json = ?
+                WHERE cohort_id = ?
+                """,
+                (now_utc, performed_by, json.dumps(history), cohort_id),
+            )
+            conn.commit()
+
+        self._log_audit(
+            "Holdout_Cohort",
+            cohort_id,
+            "RELEASE",
+            details={"reason": req.reason},
+            performed_by=performed_by,
+        )
+
+        return {
+            "cohort_id": cohort_id,
+            "pilot_id": cohort["pilot_id"],
+            "policy_name": cohort["policy_name"],
+            "eligible_service_definition": cohort["eligible_service_definition"],
+            "reserved_service_ids": json.loads(cohort["reserved_service_ids_json"]),
+            "status": "RELEASED",
+            "created_at": cohort["created_at"],
+            "created_by": cohort["created_by"],
+            "sealed_at": cohort["sealed_at"],
+            "sealed_by": cohort["sealed_by"],
+            "released_at": now_utc,
+            "released_by": performed_by,
+            "change_history": history,
+        }
+
+    def get_holdout_cohort(self, cohort_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieve active or specific holdout cohort record."""
+        with get_pilot_connection(self.db_path) as conn:
+            cursor = conn.cursor()
+            if cohort_id:
+                cursor.execute("SELECT * FROM holdout_cohorts WHERE cohort_id = ?", (cohort_id,))
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM holdout_cohorts
+                    ORDER BY CASE status WHEN 'SEALED' THEN 1 WHEN 'RESERVED' THEN 2 ELSE 3 END, created_at DESC
+                    LIMIT 1
+                    """
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            return {
+                "cohort_id": row["cohort_id"],
+                "pilot_id": row["pilot_id"],
+                "policy_name": row["policy_name"],
+                "eligible_service_definition": row["eligible_service_definition"],
+                "reserved_service_ids": json.loads(row["reserved_service_ids_json"]),
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "created_by": row["created_by"],
+                "sealed_at": row["sealed_at"],
+                "sealed_by": row["sealed_by"],
+                "released_at": row["released_at"],
+                "released_by": row["released_by"],
+                "change_history": json.loads(row["change_history_json"]),
+            }
+

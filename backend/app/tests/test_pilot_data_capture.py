@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.main import app
+from backend.app.pilot.auth import AuthenticatedActor, Role, get_current_actor
 from backend.app.pilot.config import PILOT_CUTOFF_HOURS_BEFORE_SERVICE, validate_pilot_db_path
 from backend.app.pilot.database import get_pilot_connection, init_pilot_db, reset_pilot_db
 from backend.app.pilot.router import get_pilot_service
@@ -536,7 +537,11 @@ def test_holdout_protection_in_data_export(temp_pilot_service: PilotDataService)
 
 def test_fastapi_pilot_endpoints(client: TestClient, temp_pilot_service: PilotDataService):
     """Test pilot API endpoints via HTTP client using an isolated temporary database."""
+    admin_actor = AuthenticatedActor(
+        actor_id="test_admin", role=Role.ADMIN, is_authenticated=True, issued_at=1000.0, expires_at=9999999999.0
+    )
     app.dependency_overrides[get_pilot_service] = lambda: temp_pilot_service
+    app.dependency_overrides[get_current_actor] = lambda: admin_actor
     try:
         # 1. Create a service
         srv_payload = {
@@ -578,7 +583,11 @@ def test_fastapi_pilot_endpoints(client: TestClient, temp_pilot_service: PilotDa
 
 def test_fastapi_upload_size_limit(client: TestClient, temp_pilot_service: PilotDataService):
     """Verify HTTP upload size limit rejects oversized POS CSV payloads with HTTP 413."""
+    admin_actor = AuthenticatedActor(
+        actor_id="test_admin", role=Role.ADMIN, is_authenticated=True, issued_at=1000.0, expires_at=9999999999.0
+    )
     app.dependency_overrides[get_pilot_service] = lambda: temp_pilot_service
+    app.dependency_overrides[get_current_actor] = lambda: admin_actor
     try:
         # Construct payload > 2MB
         oversized_csv = "service_date,meal_period,canteen_section,portions_served\n" + ("2026-11-20,Lunch,A,10\n" * 100000)
@@ -596,7 +605,11 @@ def test_fastapi_upload_size_limit(client: TestClient, temp_pilot_service: Pilot
 
 def test_fastapi_record_correction_endpoints(client: TestClient, temp_pilot_service: PilotDataService):
     """Verify HTTP record correction endpoints enforce mandatory correction reason."""
+    supervisor_actor = AuthenticatedActor(
+        actor_id="chef_tanya", role=Role.SUPERVISOR, is_authenticated=True, issued_at=1000.0, expires_at=9999999999.0
+    )
     app.dependency_overrides[get_pilot_service] = lambda: temp_pilot_service
+    app.dependency_overrides[get_current_actor] = lambda: supervisor_actor
     try:
         # Schedule service, item, menu, and production
         srv = temp_pilot_service.create_meal_service(
@@ -628,3 +641,4 @@ def test_fastapi_record_correction_endpoints(client: TestClient, temp_pilot_serv
         assert data["correction_reason"] == "Scale was adjusted after tare check"
     finally:
         app.dependency_overrides.clear()
+
